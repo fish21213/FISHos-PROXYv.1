@@ -1,0 +1,13 @@
+{
+  "name": "fishos-proxy",
+  "version": "4.0.0",
+  "description": "FISHos hardened Node.js proxy server",
+  "main": "fishos-proxy.js",
+  "scripts": {
+    "start": "node fishos-proxy.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
