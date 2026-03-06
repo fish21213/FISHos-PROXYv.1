@@ -21,7 +21,7 @@ const net    = require('net');
 const PORT             = process.env.PORT || 3000;
 const ALLOWED_SCHEMES  = ['http:', 'https:'];
 const ALLOWED_PORTS    = [80, 443, 8080, 8443];
-const PROXY_TIMEOUT_MS = 10_000;          // 10 seconds
+const PROXY_TIMEOUT_MS = 60_000;          // 60 seconds (LLM APIs can be slow)
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5 MB
 
 // Origins allowed to use this proxy.
@@ -105,18 +105,26 @@ async function resolveAndValidate(hostname) {
  * Fetch the target URL with the hostname pinned to a pre-resolved IP.
  * This prevents DNS rebinding (TOCTOU) between validation and request.
  */
-function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl) {
+function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl, method = 'GET', forwardHeaders = {}, body = null) {
   return new Promise((resolve, reject) => {
     const parsed   = new URL(targetUrl);
     const isHttps  = parsed.protocol === 'https:';
     const port     = parsed.port || (isHttps ? 443 : 80);
     const lib      = isHttps ? https : http;
 
+    // Build safe forwarded headers — strip hop-by-hop and host
+    const hopByHop = new Set(['host', 'connection', 'keep-alive', 'proxy-authenticate',
+      'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade']);
+    const safeForwardedHeaders = {};
+    for (const [k, v] of Object.entries(forwardHeaders)) {
+      if (!hopByHop.has(k.toLowerCase())) safeForwardedHeaders[k] = v;
+    }
+
     const options = {
-      hostname: resolvedIP,      // use IP directly — bypasses DNS entirely
+      hostname: resolvedIP,
       port,
       path: parsed.pathname + parsed.search,
-      method: 'GET',
+      method: method,
       headers: {
         'Host':            parsed.hostname,
         'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -126,12 +134,11 @@ function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl) {
         'Cache-Control':   'no-cache',
         'Pragma':          'no-cache',
         'Upgrade-Insecure-Requests': '1',
+        ...safeForwardedHeaders,  // forward API keys, content-type, etc.
+        ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
       },
-      // For HTTPS, verify cert against the *original* hostname, not the IP
       rejectUnauthorized: isHttps,
       servername: isHttps ? parsed.hostname : undefined,
-      // Never follow redirects automatically (a redirect could land on private IP)
-      // We handle this by not using fetch's redirect:follow
     };
 
     const timer = setTimeout(() => {
@@ -158,15 +165,22 @@ function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl) {
 
         // Re-validate the redirect target IP (prevent redirect to private IP)
         resolveAndValidate(redirectUrl.hostname)
-          .then(redirectIP => fetchWithPinnedDNS(redirectUrl.href, redirectIP, timeoutMs, redirectUrl.href))
+          .then(redirectIP => fetchWithPinnedDNS(redirectUrl.href, redirectIP, timeoutMs, redirectUrl.href, method, forwardHeaders, body))
           .then(resolve)
           .catch(reject);
         return;
       }
 
       if (res.statusCode >= 400) {
-        res.destroy();
-        return reject(new Error(`Upstream returned HTTP ${res.statusCode}.`));
+        // Don't swallow API errors — stream them back so the client can read them
+        const errChunks = [];
+        res.on('data', c => errChunks.push(c));
+        res.on('end', () => resolve({
+          body: Buffer.concat(errChunks).toString('utf-8'),
+          contentType: res.headers['content-type'] || 'application/json',
+          statusCode: res.statusCode,
+        }));
+        return;
       }
 
       const chunks = [];
@@ -216,6 +230,7 @@ function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl) {
     });
 
     req.on('error', err => { clearTimeout(timer); reject(err); });
+    if (body) req.write(body);
     req.end();
   });
 }
@@ -236,8 +251,8 @@ const server = http.createServer(async (req, res) => {
   // ALLOWED_ORIGINS is set to '*' by default which permits the local HTML file,
   // hosted pages, and any other origin. Tighten this in production if needed.
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With, Authorization, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access');
   res.setHeader('Access-Control-Max-Age', '86400');
 
   if (req.method === 'OPTIONS') {
@@ -246,8 +261,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Only allow GET requests
-  if (req.method !== 'GET') {
+  // Only allow GET and POST requests
+  if (req.method !== 'GET' && req.method !== 'POST') {
     res.writeHead(405, { 'Content-Type': 'text/plain' });
     res.end('Method not allowed.');
     return;
@@ -305,10 +320,29 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 5. Fetch with pinned DNS (TOCTOU / rebinding fix)
+    // 5. Collect request body (for POST)
+    let requestBody = null;
+    if (req.method === 'POST') {
+      requestBody = await new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+        req.on('error', reject);
+      });
+    }
+
+    // Forward relevant request headers (API keys, content-type, etc.)
+    const forwardHeaders = {};
+    const headersToForward = ['content-type', 'authorization', 'x-api-key',
+      'anthropic-version', 'anthropic-dangerous-direct-browser-access'];
+    for (const h of headersToForward) {
+      if (req.headers[h]) forwardHeaders[h] = req.headers[h];
+    }
+
+    // 6. Fetch with pinned DNS (TOCTOU / rebinding fix)
     let result;
     try {
-      result = await fetchWithPinnedDNS(rawTarget, resolvedIP, PROXY_TIMEOUT_MS, rawTarget);
+      result = await fetchWithPinnedDNS(rawTarget, resolvedIP, PROXY_TIMEOUT_MS, rawTarget, req.method, forwardHeaders, requestBody);
     } catch (err) {
       res.writeHead(502, { 'Content-Type': 'text/plain' });
       res.end('Proxy error: ' + err.message);
@@ -319,7 +353,7 @@ const server = http.createServer(async (req, res) => {
     //    Intentionally omit X-Frame-Options and CSP frame-ancestors so the
     //    content can render inside FISHos's browser div.
     const safeContentType = sanitizeContentType(result.contentType);
-    res.writeHead(200, {
+    res.writeHead(result.statusCode, {
       'Content-Type':           safeContentType + (safeContentType.includes('text') ? '; charset=utf-8' : ''),
       'X-Content-Type-Options': 'nosniff',
       // Never forward cookies from proxied sites
