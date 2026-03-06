@@ -215,17 +215,13 @@ const server = http.createServer(async (req, res) => {
   const parsed   = url.parse(req.url, true);
   const pathname = parsed.pathname;
 
-  // ── CORS headers ──────────────────────────────────────────────────
-  const origin = req.headers['origin'] || '';
-  const allowedOrigin = ALLOWED_ORIGINS === '*'
-    ? '*'
-    : (Array.isArray(ALLOWED_ORIGINS) && ALLOWED_ORIGINS.includes(origin) ? origin : '');
-
-  if (allowedOrigin) {
-    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  }
+  // ── CORS headers — set on every response so fetch() works from any origin ──
+  // ALLOWED_ORIGINS is set to '*' by default which permits the local HTML file,
+  // hosted pages, and any other origin. Tighten this in production if needed.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With');
+  res.setHeader('Access-Control-Max-Age', '86400');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
