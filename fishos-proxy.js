@@ -1,0 +1,302 @@
+/**
+ * FISHos Node.js Proxy Server
+ * Hardened equivalent of the PHP proxy with full SSRF protection.
+ *
+ * Usage:
+ *   node fishos-proxy.js
+ *
+ * Requires Node.js 18+ (for built-in fetch).
+ * For older Node, run: npm install node-fetch and uncomment the import below.
+ */
+
+'use strict';
+
+const http   = require('http');
+const https  = require('https');
+const dns    = require('dns').promises;
+const url    = require('url');
+const net    = require('net');
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+const PORT             = process.env.PORT || 3000;
+const ALLOWED_SCHEMES  = ['http:', 'https:'];
+const ALLOWED_PORTS    = [80, 443, 8080, 8443];
+const PROXY_TIMEOUT_MS = 10_000;          // 10 seconds
+const MAX_RESPONSE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+// Origins allowed to use this proxy.
+// Set to '*' to allow any origin, or list specific origins e.g:
+//   ['https://mysite.com', 'http://localhost:8080']
+const ALLOWED_ORIGINS  = '*';
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the IP is private, loopback, link-local, or reserved.
+ * Covers IPv4 and IPv6.
+ */
+function isPrivateIP(ip) {
+  // Reject loopback
+  if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true;
+
+  // Reject IPv6 loopback / unspecified
+  if (ip === '::' || ip.startsWith('::ffff:127.')) return true;
+
+  // IPv4 private ranges
+  const privateRanges = [
+    /^10\./,                          // 10.0.0.0/8
+    /^172\.(1[6-9]|2\d|3[01])\./,    // 172.16.0.0/12
+    /^192\.168\./,                    // 192.168.0.0/16
+    /^127\./,                         // 127.0.0.0/8 (loopback)
+    /^169\.254\./,                    // 169.254.0.0/16 (link-local)
+    /^0\./,                           // 0.0.0.0/8
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // 100.64.0.0/10 (CGNAT)
+    /^192\.0\.0\./,                   // 192.0.0.0/24 (IETF protocol)
+    /^192\.0\.2\./,                   // 192.0.2.0/24 (TEST-NET-1)
+    /^198\.51\.100\./,                // 198.51.100.0/24 (TEST-NET-2)
+    /^203\.0\.113\./,                 // 203.0.113.0/24 (TEST-NET-3)
+    /^(22[4-9]|23\d|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255)\./, // 224.0.0.0+ (multicast/reserved)
+  ];
+
+  // IPv6 private / link-local
+  const privateIPv6 = [
+    /^fe[89ab][0-9a-f]:/i,   // link-local fe80::/10
+    /^fc/i,                   // unique local fc00::/7
+    /^fd/i,                   // unique local fd00::/8
+  ];
+
+  if (net.isIPv4(ip)) return privateRanges.some(r => r.test(ip));
+  if (net.isIPv6(ip)) return privateIPv6.some(r => r.test(ip));
+
+  return true; // unknown format — block it
+}
+
+/**
+ * Resolve hostname to IP, check it's public, return the resolved IP.
+ * Throws an error string if blocked.
+ */
+async function resolveAndValidate(hostname) {
+  // If already an IP, validate directly
+  if (net.isIP(hostname)) {
+    if (isPrivateIP(hostname)) throw new Error('Blocked: private/reserved IP address.');
+    return hostname;
+  }
+
+  let addresses;
+  try {
+    // dns.lookup resolves using OS resolver (same as curl / gethostbyname)
+    const result = await dns.lookup(hostname, { all: true });
+    addresses = result.map(r => r.address);
+  } catch {
+    throw new Error('Could not resolve hostname.');
+  }
+
+  if (!addresses || addresses.length === 0) throw new Error('Could not resolve hostname.');
+
+  // Check ALL resolved addresses — block if any is private (DNS rebinding defence)
+  for (const ip of addresses) {
+    if (isPrivateIP(ip)) throw new Error('Blocked: hostname resolves to private/reserved IP.');
+  }
+
+  // Return the first resolved address to use for the pinned request
+  return addresses[0];
+}
+
+/**
+ * Fetch the target URL with the hostname pinned to a pre-resolved IP.
+ * This prevents DNS rebinding (TOCTOU) between validation and request.
+ */
+function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const parsed   = new URL(targetUrl);
+    const isHttps  = parsed.protocol === 'https:';
+    const port     = parsed.port || (isHttps ? 443 : 80);
+    const lib      = isHttps ? https : http;
+
+    const options = {
+      hostname: resolvedIP,      // use IP directly — bypasses DNS entirely
+      port,
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      headers: {
+        'Host': parsed.hostname, // send correct Host header for vhosts / SNI
+        'User-Agent': 'FISHosCyberBrowser/4.0',
+      },
+      // For HTTPS, verify cert against the *original* hostname, not the IP
+      rejectUnauthorized: isHttps,
+      servername: isHttps ? parsed.hostname : undefined,
+      // Never follow redirects automatically (a redirect could land on private IP)
+      // We handle this by not using fetch's redirect:follow
+    };
+
+    const timer = setTimeout(() => {
+      req.destroy(new Error('Request timed out.'));
+    }, timeoutMs);
+
+    const req = lib.request(options, res => {
+      clearTimeout(timer);
+
+      // Block redirects — a 3xx could redirect to a private address
+      if (res.statusCode >= 300 && res.statusCode < 400) {
+        res.destroy();
+        return reject(new Error(`Redirect blocked (${res.statusCode}). Direct URLs only.`));
+      }
+
+      if (res.statusCode >= 400) {
+        res.destroy();
+        return reject(new Error(`Upstream returned HTTP ${res.statusCode}.`));
+      }
+
+      const chunks = [];
+      let totalBytes = 0;
+
+      res.on('data', chunk => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_RESPONSE_BYTES) {
+          res.destroy();
+          return reject(new Error('Response too large (limit: 5 MB).'));
+        }
+        chunks.push(chunk);
+      });
+
+      res.on('end', () => {
+        resolve({
+          body:        Buffer.concat(chunks),
+          contentType: res.headers['content-type'] || 'text/html',
+          statusCode:  res.statusCode,
+        });
+      });
+
+      res.on('error', reject);
+    });
+
+    req.on('error', err => { clearTimeout(timer); reject(err); });
+    req.end();
+  });
+}
+
+/**
+ * Sanitize a Content-Type header value to prevent header injection.
+ */
+function sanitizeContentType(ct) {
+  return ct.replace(/[^\w\/;=\-. ]/g, '').slice(0, 200) || 'text/html';
+}
+
+// ─── Request Handler ──────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  const parsed   = url.parse(req.url, true);
+  const pathname = parsed.pathname;
+
+  // ── CORS headers ──────────────────────────────────────────────────
+  const origin = req.headers['origin'] || '';
+  const allowedOrigin = ALLOWED_ORIGINS === '*'
+    ? '*'
+    : (Array.isArray(ALLOWED_ORIGINS) && ALLOWED_ORIGINS.includes(origin) ? origin : '');
+
+  if (allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Only allow GET requests
+  if (req.method !== 'GET') {
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.end('Method not allowed.');
+    return;
+  }
+
+  // ── Route: / — simple status page ─────────────────────────────────
+  if (pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('FISHos Proxy v4.0 — running.\nUsage: /proxy?url=https://example.com');
+    return;
+  }
+
+  // ── Route: /proxy ──────────────────────────────────────────────────
+  if (pathname === '/proxy') {
+    const rawTarget = parsed.query.url;
+
+    if (!rawTarget) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Missing ?url= parameter.');
+      return;
+    }
+
+    // 1. Parse and validate URL structure
+    let targetUrl;
+    try {
+      targetUrl = new URL(rawTarget);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Invalid URL.');
+      return;
+    }
+
+    // 2. Scheme check
+    if (!ALLOWED_SCHEMES.includes(targetUrl.protocol)) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Only HTTP/HTTPS allowed.');
+      return;
+    }
+
+    // 3. Port check
+    const port = parseInt(targetUrl.port) || (targetUrl.protocol === 'https:' ? 443 : 80);
+    if (!ALLOWED_PORTS.includes(port)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Blocked: port not allowed.');
+      return;
+    }
+
+    // 4. DNS resolve + private IP check (SSRF protection)
+    let resolvedIP;
+    try {
+      resolvedIP = await resolveAndValidate(targetUrl.hostname);
+    } catch (err) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(err.message);
+      return;
+    }
+
+    // 5. Fetch with pinned DNS (TOCTOU / rebinding fix)
+    let result;
+    try {
+      result = await fetchWithPinnedDNS(rawTarget, resolvedIP, PROXY_TIMEOUT_MS);
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end('Proxy error: ' + err.message);
+      return;
+    }
+
+    // 6. Send safe response headers + body
+    const safeContentType = sanitizeContentType(result.contentType);
+    res.writeHead(200, {
+      'Content-Type':              safeContentType,
+      'X-Frame-Options':           'SAMEORIGIN',
+      'X-Content-Type-Options':    'nosniff',
+      'Content-Security-Policy':   'sandbox allow-scripts allow-forms',
+      // Explicitly strip cookies from proxied responses
+      // (we never forward Set-Cookie)
+    });
+    res.end(result.body);
+    return;
+  }
+
+  // ── 404 fallback ───────────────────────────────────────────────────
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found.');
+});
+
+server.listen(PORT, () => {
+  console.log(`FISHos Proxy v4.0 running at http://localhost:${PORT}`);
+  console.log(`Proxy endpoint: http://localhost:${PORT}/proxy?url=https://example.com`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+process.on('SIGINT',  () => server.close(() => process.exit(0)));
