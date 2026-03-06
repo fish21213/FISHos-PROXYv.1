@@ -11,6 +11,8 @@
 
 'use strict';
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const http   = require('http');
 const https  = require('https');
 const dns    = require('dns').promises;
