@@ -105,7 +105,7 @@ async function resolveAndValidate(hostname) {
  * Fetch the target URL with the hostname pinned to a pre-resolved IP.
  * This prevents DNS rebinding (TOCTOU) between validation and request.
  */
-function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs) {
+function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl) {
   return new Promise((resolve, reject) => {
     const parsed   = new URL(targetUrl);
     const isHttps  = parsed.protocol === 'https:';
@@ -118,8 +118,14 @@ function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs) {
       path: parsed.pathname + parsed.search,
       method: 'GET',
       headers: {
-        'Host': parsed.hostname, // send correct Host header for vhosts / SNI
-        'User-Agent': 'FISHosCyberBrowser/4.0',
+        'Host':            parsed.hostname,
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'identity',
+        'Cache-Control':   'no-cache',
+        'Pragma':          'no-cache',
+        'Upgrade-Insecure-Requests': '1',
       },
       // For HTTPS, verify cert against the *original* hostname, not the IP
       rejectUnauthorized: isHttps,
@@ -159,9 +165,32 @@ function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs) {
       });
 
       res.on('end', () => {
+        let body = Buffer.concat(chunks).toString('utf-8');
+        const contentType = res.headers['content-type'] || 'text/html';
+
+        // If HTML, rewrite relative URLs so assets (images, CSS, JS) load correctly
+        // and strip tags that would break rendering
+        if (contentType.includes('text/html')) {
+          const base = new URL(originalUrl);
+          const origin = base.origin;
+          const baseHref = `<base href="${origin}/">`;
+
+          // Inject <base> tag so relative URLs resolve against the original site
+          body = body.replace(/<head([^>]*)>/i, `<head$1>${baseHref}`);
+
+          // Strip Content-Security-Policy meta tags (they block inline content)
+          body = body.replace(/<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+
+          // Rewrite absolute links to route back through this proxy
+          // so clicking links stays within FISHos browser
+          body = body.replace(/href=["'](https?:\/\/[^"']+)["']/gi, (match, url) => {
+            return `href="/proxy?url=${encodeURIComponent(url)}"`;
+          });
+        }
+
         resolve({
-          body:        Buffer.concat(chunks),
-          contentType: res.headers['content-type'] || 'text/html',
+          body,
+          contentType,
           statusCode:  res.statusCode,
         });
       });
@@ -266,7 +295,7 @@ const server = http.createServer(async (req, res) => {
     // 5. Fetch with pinned DNS (TOCTOU / rebinding fix)
     let result;
     try {
-      result = await fetchWithPinnedDNS(rawTarget, resolvedIP, PROXY_TIMEOUT_MS);
+      result = await fetchWithPinnedDNS(rawTarget, resolvedIP, PROXY_TIMEOUT_MS, rawTarget);
     } catch (err) {
       res.writeHead(502, { 'Content-Type': 'text/plain' });
       res.end('Proxy error: ' + err.message);
@@ -274,14 +303,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 6. Send safe response headers + body
+    //    Intentionally omit X-Frame-Options and CSP frame-ancestors so the
+    //    content can render inside FISHos's browser div.
     const safeContentType = sanitizeContentType(result.contentType);
     res.writeHead(200, {
-      'Content-Type':              safeContentType,
-      'X-Frame-Options':           'SAMEORIGIN',
-      'X-Content-Type-Options':    'nosniff',
-      'Content-Security-Policy':   'sandbox allow-scripts allow-forms',
-      // Explicitly strip cookies from proxied responses
-      // (we never forward Set-Cookie)
+      'Content-Type':           safeContentType + (safeContentType.includes('text') ? '; charset=utf-8' : ''),
+      'X-Content-Type-Options': 'nosniff',
+      // Never forward cookies from proxied sites
     });
     res.end(result.body);
     return;
