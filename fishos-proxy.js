@@ -141,10 +141,27 @@ function fetchWithPinnedDNS(targetUrl, resolvedIP, timeoutMs, originalUrl) {
     const req = lib.request(options, res => {
       clearTimeout(timer);
 
-      // Block redirects — a 3xx could redirect to a private address
+      // Handle redirects safely — re-validate the new location before following
       if (res.statusCode >= 300 && res.statusCode < 400) {
         res.destroy();
-        return reject(new Error(`Redirect blocked (${res.statusCode}). Direct URLs only.`));
+        const location = res.headers['location'];
+        if (!location) return reject(new Error('Redirect with no location header.'));
+
+        let redirectUrl;
+        try { redirectUrl = new URL(location, originalUrl); }
+        catch { return reject(new Error('Invalid redirect URL.')); }
+
+        // Only allow http/https redirects
+        if (!['http:', 'https:'].includes(redirectUrl.protocol)) {
+          return reject(new Error('Redirect to non-HTTP scheme blocked.'));
+        }
+
+        // Re-validate the redirect target IP (prevent redirect to private IP)
+        resolveAndValidate(redirectUrl.hostname)
+          .then(redirectIP => fetchWithPinnedDNS(redirectUrl.href, redirectIP, timeoutMs, redirectUrl.href))
+          .then(resolve)
+          .catch(reject);
+        return;
       }
 
       if (res.statusCode >= 400) {
